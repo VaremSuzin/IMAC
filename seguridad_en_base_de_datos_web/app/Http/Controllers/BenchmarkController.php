@@ -8,12 +8,12 @@ use Symfony\Component\Process\Exception\ProcessFailedException;
 use App\Models\BenchmarkResult;
 use App\Models\BenchmarkAttackSimulation;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class BenchmarkController extends Controller
 {
     public function index()
     {
-        // Obtener resultados históricos
         $recentResults = BenchmarkResult::orderBy('created_at', 'desc')
             ->take(10)
             ->get();
@@ -33,26 +33,38 @@ class BenchmarkController extends Controller
 
     public function runBenchmark(Request $request)
     {
+        $request->validate([
+            'dataset_size' => 'required|integer|min:10|max:10000'
+        ]);
+
         $datasetSize = $request->input('dataset_size', 100);
         
         $pythonScript = storage_path('app/python_scripts/crypto_benchmark.py');
         
         if (!file_exists($pythonScript)) {
-            return back()->with('error', 'Script Python no encontrado.');
+            return back()->with('error', 'Script Python no encontrado en: ' . $pythonScript);
         }
         
         try {
             DB::beginTransaction();
             
             $process = new Process(['python', $pythonScript, '--size', $datasetSize]);
-            $process->setTimeout(120);
+            $process->setTimeout(180); // Aumentado a 3 minutos
+            $process->setWorkingDirectory(base_path());
             $process->run();
 
             $output = $process->getOutput();
             $errorOutput = $process->getErrorOutput();
 
+            Log::info('Python Benchmark Output', ['output' => $output]);
+            Log::info('Python Benchmark Error Output', ['error' => $errorOutput]);
+
             if (!$process->isSuccessful()) {
                 DB::rollBack();
+                Log::error('Python process failed', [
+                    'exit_code' => $process->getExitCode(),
+                    'error_output' => $errorOutput
+                ]);
                 return back()->with('error', 'Error ejecutando benchmark: ' . $errorOutput);
             }
 
@@ -60,7 +72,13 @@ class BenchmarkController extends Controller
             
             if (json_last_error() !== JSON_ERROR_NONE) {
                 DB::rollBack();
+                Log::error('JSON decode error', ['error' => json_last_error_msg()]);
                 return back()->with('error', 'Error decodificando JSON: ' . json_last_error_msg());
+            }
+
+            if (isset($results['error'])) {
+                DB::rollBack();
+                return back()->with('error', 'Error en el benchmark: ' . $results['error']);
             }
 
             // GUARDAR RESULTADOS EN LA BASE DE DATOS
@@ -77,6 +95,7 @@ class BenchmarkController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
+            Log::error('Benchmark exception', ['error' => $e->getMessage()]);
             return back()->with('error', 'Excepción: ' . $e->getMessage());
         }
     }
@@ -129,15 +148,6 @@ class BenchmarkController extends Controller
                 'attack_metrics' => $attackData
             ]);
         }
-    }
-
-    public function showHistory()
-    {
-        $results = BenchmarkResult::with('attackSimulations')
-            ->orderBy('created_at', 'desc')
-            ->paginate(20);
-
-        return view('benchmark.history', compact('results'));
     }
 
     public function testPython()
